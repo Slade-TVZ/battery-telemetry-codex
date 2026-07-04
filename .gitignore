@@ -1,0 +1,6 @@
+data/*.json
+data/*.csv
+data/sessions/*.json
+data/sessions/*.log
+data/sessions/
+!data/.gitkeep
