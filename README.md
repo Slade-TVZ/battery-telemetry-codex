@@ -85,6 +85,14 @@ The brief status includes:
 - estimated monthly kWh and EUR for 24/7 operation in the detected mode
 - inferred display state when Windows exposes enough idle/display evidence
 
+## Runtime interpretation
+
+The main runtime estimate is based on the current measured discharge rate whenever the laptop is on battery. A closed or powered-off display is not treated as low-power by itself.
+
+- `Ekran ugasen/zatvoren` only describes display/idle evidence.
+- `Aktivan rad` means the laptop is still consuming battery at the measured live rate.
+- `Standby/hibernacija` is a separate scenario and is shown separately because Windows must actually enter that mode for the multi-day estimate to apply.
+
 ## Notes
 
 - This laptop uses Modern Standby (`Connected Standby`), so the low-power estimate models that behavior rather than classic `S3` sleep.

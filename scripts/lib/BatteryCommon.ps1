@@ -871,6 +871,27 @@ function Get-ModelRuntimeMinutes {
     return [int][math]::Round(($RemainingCapacityMWh * 60.0) / $RateMW)
 }
 
+function Get-StatusModeLabel {
+    param(
+        [Parameter(Mandatory)]
+        $Status
+    )
+
+    $displayState = if ($Status.display) { [string]$Status.display.state } else { 'display_state_unknown' }
+    $displayText = switch ($displayState) {
+        'display_likely_off' { 'ekran ugasen/zatvoren' }
+        'display_likely_on' { 'ekran vjerojatno ukljucen' }
+        default { 'stanje ekrana nepoznato' }
+    }
+
+    switch ([string]$Status.derivedMode) {
+        'battery_active' { return ('Aktivan rad, {0}' -f $displayText) }
+        'battery_low_power' { return ('Low-power/standby, {0}' -f $displayText) }
+        'ac' { return ('Na struji, {0}' -f $displayText) }
+        default { return ('{0}, {1}' -f $Status.derivedMode, $displayText) }
+    }
+}
+
 function Get-CurrentTariffPeriod {
     param(
         [Parameter(Mandatory)]
@@ -1291,6 +1312,11 @@ function Get-BatteryStatusPayload {
 
     $activeMinutes = Get-ModelRuntimeMinutes -RemainingCapacityMWh $Snapshot.RemainingCapacityMWh -RateMW $activeRateMW
     $lowPowerMinutes = Get-ModelRuntimeMinutes -RemainingCapacityMWh $Snapshot.RemainingCapacityMWh -RateMW $lowPowerRateMW
+    $currentMeasuredMinutes = $null
+    if ($Snapshot.PowerSource -eq 'Battery' -and $Snapshot.DischargeRateMW -and $Snapshot.DischargeRateMW -gt 0) {
+        $currentMeasuredMinutes = Get-ModelRuntimeMinutes -RemainingCapacityMWh $Snapshot.RemainingCapacityMWh -RateMW $Snapshot.DischargeRateMW
+    }
+
     if (-not $Settings) {
         $Settings = Get-BatterySettings -SettingsPath ''
     }
@@ -1317,6 +1343,29 @@ function Get-BatteryStatusPayload {
             evidence   = $Snapshot.DisplayEvidence
         }
         powerCost                 = $powerCost
+        runtimeScenarios          = [pscustomobject]@{
+            currentMeasured    = [pscustomobject]@{
+                minutes     = $currentMeasuredMinutes
+                rateMW      = if ($Snapshot.PowerSource -eq 'Battery') { $Snapshot.DischargeRateMW } else { $null }
+                source      = if ($currentMeasuredMinutes) { 'live_discharge_rate' } else { 'not_available_on_ac' }
+                isCurrent   = [bool]($Snapshot.PowerSource -eq 'Battery' -and $currentMeasuredMinutes)
+                description = 'Current battery runtime based on the live measured discharge rate.'
+            }
+            activeEstimated    = [pscustomobject]@{
+                minutes     = $activeMinutes
+                rateMW      = $activeRateMW
+                source      = $activeSource
+                isCurrent   = [bool]($Snapshot.PowerSource -eq 'Battery' -and $Snapshot.DerivedMode -eq 'battery_active')
+                description = 'Active-work runtime estimate if the current workload continues.'
+            }
+            standbyOrHibernate = [pscustomobject]@{
+                minutes     = $lowPowerMinutes
+                rateMW      = $lowPowerRateMW
+                source      = $lowPowerSource
+                isCurrent   = [bool]($Snapshot.PowerSource -eq 'Battery' -and $Snapshot.DerivedMode -eq 'battery_low_power')
+                description = 'Separate standby/hibernate-style scenario; not implied by screen closed alone.'
+            }
+        }
         estimatedActiveMinutes    = $activeMinutes
         estimatedLowPowerMinutes  = $lowPowerMinutes
         activeEstimate            = [pscustomobject]@{
@@ -1342,13 +1391,18 @@ function Get-BatteryStatusSummary {
 
     $sampleTime = ConvertTo-DateTimeOffsetValue -Value $Status.lastSampleTime
     $sampleAgeMinutes = [math]::Round(([DateTimeOffset]::Now - $sampleTime).TotalMinutes, 1)
+    $runtimeScenarios = Get-ObjectPropertyValue -InputObject $Status -Name 'runtimeScenarios'
+    $currentMeasured = if ($runtimeScenarios) { Get-ObjectPropertyValue -InputObject $runtimeScenarios -Name 'currentMeasured' } else { $null }
+    $currentMeasuredMinutes = if ($currentMeasured) { Get-ObjectPropertyValue -InputObject $currentMeasured -Name 'minutes' } else { $null }
 
     @(
         ('Battery: {0}%' -f ([math]::Round([double]$Status.chargePercent, 1)))
         ('Source: {0}' -f $Status.powerSource)
+        ('Mode: {0}' -f (Get-StatusModeLabel -Status $Status))
         ('Last sample: {0} ({1} min ago)' -f $sampleTime.ToString('yyyy-MM-dd HH:mm:ss zzz'), $sampleAgeMinutes)
-        ('Estimate if unplugged now: {0}' -f (Format-MinutesAsDuration -Minutes $Status.estimatedActiveMinutes))
-        ('Estimate in low-power/connected-standby mode: {0}' -f (Format-MinutesAsDuration -Minutes $Status.estimatedLowPowerMinutes))
+        ('Current measured runtime: {0}' -f (Format-MinutesAsDuration -Minutes $currentMeasuredMinutes))
+        ('Active-work estimate: {0}' -f (Format-MinutesAsDuration -Minutes $Status.estimatedActiveMinutes))
+        ('Standby/hibernate scenario: {0}' -f (Format-MinutesAsDuration -Minutes $Status.estimatedLowPowerMinutes))
         ('Active estimate source: {0}' -f $(if ($Status.activeEstimate.source) { $Status.activeEstimate.source } else { 'n/a' }))
         ('Low-power estimate source: {0}' -f $(if ($Status.lowPowerEstimate.source) { $Status.lowPowerEstimate.source } else { 'n/a' }))
     ) -join [Environment]::NewLine
@@ -1363,21 +1417,36 @@ function Get-BatteryChatSummary {
     $sampleTime = ConvertTo-DateTimeOffsetValue -Value $Status.lastSampleTime
     $sampleAgeMinutes = [math]::Round(([DateTimeOffset]::Now - $sampleTime).TotalMinutes, 1)
     $sourceLabel = if ($Status.powerSource -eq 'AC') { 'struja' } else { 'baterija' }
+    $runtimeScenarios = Get-ObjectPropertyValue -InputObject $Status -Name 'runtimeScenarios'
+    $currentMeasured = if ($runtimeScenarios) { Get-ObjectPropertyValue -InputObject $runtimeScenarios -Name 'currentMeasured' } else { $null }
+    $currentMeasuredMinutes = if ($currentMeasured) { Get-ObjectPropertyValue -InputObject $currentMeasured -Name 'minutes' } else { $Status.estimatedActiveMinutes }
+    $currentMeasuredSource = if ($currentMeasured) { Get-ObjectPropertyValue -InputObject $currentMeasured -Name 'source' } else { $null }
+    $currentDuration = Format-MinutesAsDuration -Minutes $currentMeasuredMinutes
     $activeDuration = Format-MinutesAsDuration -Minutes $Status.estimatedActiveMinutes
-    $lowPowerDuration = Format-MinutesAsDuration -Minutes $Status.estimatedLowPowerMinutes
-    $displayLabel = switch ($Status.display.state) {
-        'display_likely_off' { 'ekran vjerojatno ugasen' }
-        'display_likely_on' { 'ekran vjerojatno ukljucen' }
-        default { 'stanje ekrana nepoznato' }
-    }
+    $standbyDuration = Format-MinutesAsDuration -Minutes $Status.estimatedLowPowerMinutes
+    $modeLabel = Get-StatusModeLabel -Status $Status
 
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add(('Baterija: {0}%' -f ([math]::Round([double]$Status.chargePercent, 1))))
     $lines.Add(('Napajanje: {0}' -f $sourceLabel))
-    $lines.Add(('Mod: {0}, {1}' -f $Status.derivedMode, $displayLabel))
+    $lines.Add(('Mod: {0}' -f $modeLabel))
     $lines.Add(('Zadnje mjerenje: {0} ({1} min staro)' -f $sampleTime.ToString('yyyy-MM-dd HH:mm'), $sampleAgeMinutes))
-    $lines.Add(('Ako iskljucis struju: oko {0}' -f $activeDuration))
-    $lines.Add(('Zatvoren ekran / low-power: oko {0}' -f $lowPowerDuration))
+
+    if ($Status.powerSource -eq 'Battery') {
+        $lines.Add(('Preostalo pri trenutnoj potrosnji: oko {0}' -f $currentDuration))
+        if ($Status.derivedMode -ne 'battery_active' -or $currentMeasuredSource -ne 'live_discharge_rate') {
+            $lines.Add(('Aktivan rad ako se potrosnja promijeni na model: oko {0}' -f $activeDuration))
+        }
+    }
+    else {
+        $lines.Add(('Ako iskljucis punjac i potrosnja ostane ista: oko {0}' -f $activeDuration))
+    }
+
+    $lines.Add(('Standby/hibernacija ako Windows stvarno udje u taj mod: oko {0}' -f $standbyDuration))
+
+    if ($Status.display.state -eq 'display_likely_off' -and $Status.derivedMode -eq 'battery_active') {
+        $lines.Add('Napomena: ekran je ugasen/zatvoren, ali racunalo radi aktivno. Procjena se temelji na stvarnoj potrosnji.')
+    }
 
     if ($Status.powerCost) {
         $lines.Add(('Trenutna procjena laptopa: {0} W' -f $Status.powerCost.dcPowerW))

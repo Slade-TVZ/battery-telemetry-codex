@@ -244,9 +244,9 @@ $html = @'
         <div id="source" class="small">Cekam mjerenje...</div>
       </article>
       <article class="card">
-        <div class="label">Procjena rada</div>
+        <div class="label">Sadasnja potrosnja</div>
         <div id="runtime" class="value">--</div>
-        <div id="lowPower" class="small">Low-power: --</div>
+        <div id="lowPower" class="small">Standby/hibernacija: --</div>
       </article>
       <article class="card">
         <div class="label">Mjesecno ovako</div>
@@ -304,16 +304,35 @@ $html = @'
       document.getElementById('statusLine').textContent = text;
     }
 
+    function modeLabel(status) {
+      const displayState = status.display && status.display.state;
+      const displayText = displayState === 'display_likely_off'
+        ? 'ekran ugasen/zatvoren'
+        : displayState === 'display_likely_on'
+          ? 'ekran vjerojatno ukljucen'
+          : 'stanje ekrana nepoznato';
+
+      if (status.derivedMode === 'battery_active') return `Aktivan rad, ${displayText}`;
+      if (status.derivedMode === 'battery_low_power') return `Low-power/standby, ${displayText}`;
+      if (status.derivedMode === 'ac') return `Na struji, ${displayText}`;
+      return `${status.derivedMode || '--'} / ${displayText}`;
+    }
+
     async function loadStatus(refresh) {
       setStatus(refresh ? 'Mjerim sada...' : 'Ucitavam status...');
       const response = await fetch(`/api/status${refresh ? '?refresh=1' : ''}`);
       if (!response.ok) throw new Error(await response.text());
       const status = await response.json();
+      const scenarios = status.runtimeScenarios || {};
+      const current = scenarios.currentMeasured || {};
+      const standby = scenarios.standbyOrHibernate || {};
+      const primaryMinutes = current.minutes ?? status.estimatedActiveMinutes;
+      const standbyMinutes = standby.minutes ?? status.estimatedLowPowerMinutes;
       document.getElementById('charge').textContent = `${fmt.format(status.chargePercent)}%`;
       document.getElementById('source').textContent = status.powerSource === 'AC' ? 'Na struji' : 'Na bateriji';
-      document.getElementById('runtime').textContent = minutesToDuration(status.estimatedActiveMinutes);
-      document.getElementById('lowPower').textContent = `Low-power: ${minutesToDuration(status.estimatedLowPowerMinutes)}`;
-      document.getElementById('mode').textContent = `${status.derivedMode || '--'} / ${(status.display && status.display.state) || '--'}`;
+      document.getElementById('runtime').textContent = minutesToDuration(primaryMinutes);
+      document.getElementById('lowPower').textContent = `Standby/hibernacija, nije trenutno stanje: ${minutesToDuration(standbyMinutes)}`;
+      document.getElementById('mode').textContent = modeLabel(status);
       document.getElementById('lastSample').textContent = `Zadnje mjerenje: ${new Date(status.lastSampleTime).toLocaleString()}`;
       if (status.powerCost) {
         document.getElementById('cost').textContent = `${fmt.format(status.powerCost.monthlyCostEur)} EUR`;
