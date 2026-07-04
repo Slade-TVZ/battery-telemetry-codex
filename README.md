@@ -10,6 +10,8 @@ Small Windows PowerShell project that records local battery telemetry and keeps 
 - `scripts\show-battery.ps1` prints only the short chat-friendly battery summary
 - `scripts\install-task.ps1` installs a Scheduled Task that runs the collector every minute and at logon
 - `scripts\start-low-power-learning-session.ps1` records an unplug-to-replug low-power learning session and rebuilds the model when AC returns
+- `scripts\get-history.ps1` summarizes monitored uptime, historical kWh, and estimated EUR from saved samples
+- `scripts\start-dashboard.ps1` opens a local browser dashboard with Measure Now, History, and Close buttons
 - `data\settings.json` configures the electricity tariff, VAT, monthly hours, and Dell adapter efficiency used for cost estimates
 
 ## Typical usage
@@ -21,6 +23,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\get-battery-status
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\show-battery.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-task.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-low-power-learning-session.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\get-history.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-dashboard.ps1
 ```
 
 When the user asks Codex for battery state, use:
@@ -52,6 +56,22 @@ Then unplug the charger, close or turn off the screen, and plug the charger back
 - `data\current-status.json`: latest status snapshot and estimates
 - `data\install-state.json`: scheduled task install metadata
 - `data\sessions\low-power-*.json`: completed or failed low-power learning sessions
+
+## Local dashboard
+
+Run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-dashboard.ps1
+```
+
+The dashboard opens at `http://127.0.0.1:8765/` and provides:
+
+- `Izmjeri sada`: forces a fresh battery/cost measurement
+- `Povijest`: reloads historical monitored time, kWh, and EUR estimates
+- `Zatvori panel`: stops the local dashboard server
+
+Codex cannot inject persistent native buttons into this chat UI, so this local dashboard is the persistent-button layer.
 
 ## Electricity cost estimate
 

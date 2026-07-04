@@ -302,6 +302,26 @@ function ConvertTo-NullableDouble {
     }
 }
 
+function Get-ObjectPropertyValue {
+    param(
+        $InputObject,
+
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if (-not $property) {
+        return $null
+    }
+
+    return $property.Value
+}
+
 function ConvertTo-DateTimeOffsetValue {
     param(
         [Parameter(Mandatory)]
@@ -471,7 +491,7 @@ function Save-BatterySample {
 
     Ensure-Directory -Path (Split-Path -Parent $Path)
 
-    $sample = [pscustomobject]@{
+    $sample = [pscustomobject][ordered]@{
         timestamp             = $Snapshot.Timestamp
         batteryName           = $Snapshot.BatteryName
         powerSource           = $Snapshot.PowerSource
@@ -493,6 +513,22 @@ function Save-BatterySample {
     }
 
     if (Test-Path -LiteralPath $Path) {
+        $requiredColumns = @($sample.PSObject.Properties.Name)
+        $header = Get-Content -LiteralPath $Path -TotalCount 1
+        $missingColumns = @($requiredColumns | Where-Object { $header -notmatch ('(^|,)"?{0}"?(,|$)' -f [regex]::Escape($_)) })
+
+        if ($missingColumns.Count -gt 0) {
+            $existingRows = @(Import-Csv -LiteralPath $Path)
+            $normalizedRows = foreach ($row in $existingRows) {
+                $normalized = [ordered]@{}
+                foreach ($column in $requiredColumns) {
+                    $normalized[$column] = Get-ObjectPropertyValue -InputObject $row -Name $column
+                }
+                [pscustomobject]$normalized
+            }
+            $normalizedRows | Export-Csv -LiteralPath $Path -NoTypeInformation
+        }
+
         $sample | Export-Csv -LiteralPath $Path -Append -NoTypeInformation
     }
     else {
@@ -972,6 +1008,244 @@ function Get-EstimatedPowerCost {
         fixedMonthlyFeesExcluded   = $price.fixedMonthlyFeesExcluded
         costSource                 = $powerSource
         confidence                 = $confidence
+    }
+}
+
+function Get-OsUptimeSummary {
+    $os = Get-SafeCimInstance -ClassName 'Win32_OperatingSystem' | Select-Object -First 1
+    if (-not $os -or -not $os.LastBootUpTime) {
+        return $null
+    }
+
+    $bootTime = [DateTimeOffset]$os.LastBootUpTime
+    $uptimeMinutes = [math]::Round(([DateTimeOffset]::Now - $bootTime).TotalMinutes, 1)
+
+    [pscustomobject]@{
+        bootTime      = $bootTime.ToString('o')
+        uptimeMinutes = $uptimeMinutes
+        uptime        = Format-MinutesAsDuration -Minutes ([int][math]::Round($uptimeMinutes))
+    }
+}
+
+function New-HistoryBucket {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    [pscustomobject]@{
+        name                  = $Name
+        monitoredMinutes      = 0.0
+        acMinutes             = 0.0
+        batteryMinutes        = 0.0
+        displayLikelyOffMinutes = 0.0
+        estimatedKWh          = 0.0
+        estimatedCostEur      = 0.0
+        segmentCount          = 0
+        costedSegmentCount    = 0
+    }
+}
+
+function Add-HistorySegmentToBucket {
+    param(
+        [Parameter(Mandatory)]
+        $Bucket,
+
+        [Parameter(Mandatory)]
+        $PreviousSample,
+
+        [Parameter(Mandatory)]
+        [double]$DurationMinutes,
+
+        [Nullable[double]]$EstimatedKWh,
+
+        [Nullable[double]]$EstimatedCostEur
+    )
+
+    $Bucket.monitoredMinutes = [math]::Round($Bucket.monitoredMinutes + $DurationMinutes, 4)
+    $Bucket.segmentCount++
+
+    if ([string](Get-ObjectPropertyValue -InputObject $PreviousSample -Name 'powerSource') -eq 'Battery') {
+        $Bucket.batteryMinutes = [math]::Round($Bucket.batteryMinutes + $DurationMinutes, 4)
+    }
+    else {
+        $Bucket.acMinutes = [math]::Round($Bucket.acMinutes + $DurationMinutes, 4)
+    }
+
+    if ([string](Get-ObjectPropertyValue -InputObject $PreviousSample -Name 'displayState') -eq 'display_likely_off') {
+        $Bucket.displayLikelyOffMinutes = [math]::Round($Bucket.displayLikelyOffMinutes + $DurationMinutes, 4)
+    }
+
+    if ($null -ne $EstimatedKWh -and $null -ne $EstimatedCostEur) {
+        $Bucket.estimatedKWh = [math]::Round($Bucket.estimatedKWh + [double]$EstimatedKWh, 8)
+        $Bucket.estimatedCostEur = [math]::Round($Bucket.estimatedCostEur + [double]$EstimatedCostEur, 8)
+        $Bucket.costedSegmentCount++
+    }
+}
+
+function Complete-HistoryBucket {
+    param(
+        [Parameter(Mandatory)]
+        $Bucket
+    )
+
+    [pscustomobject]@{
+        name                    = $Bucket.name
+        monitoredMinutes        = [math]::Round($Bucket.monitoredMinutes, 1)
+        monitoredDuration       = Format-MinutesAsDuration -Minutes ([int][math]::Round($Bucket.monitoredMinutes))
+        acMinutes               = [math]::Round($Bucket.acMinutes, 1)
+        batteryMinutes          = [math]::Round($Bucket.batteryMinutes, 1)
+        displayLikelyOffMinutes = [math]::Round($Bucket.displayLikelyOffMinutes, 1)
+        estimatedKWh            = [math]::Round($Bucket.estimatedKWh, 4)
+        estimatedCostEur        = [math]::Round($Bucket.estimatedCostEur, 4)
+        segmentCount            = $Bucket.segmentCount
+        costedSegmentCount      = $Bucket.costedSegmentCount
+    }
+}
+
+function Get-SampleEstimatedRateMW {
+    param(
+        [Parameter(Mandatory)]
+        $Sample,
+
+        $Model
+    )
+
+    $dischargeRate = ConvertTo-NullableDouble (Get-ObjectPropertyValue -InputObject $Sample -Name 'dischargeRateMW')
+    if ([string](Get-ObjectPropertyValue -InputObject $Sample -Name 'powerSource') -eq 'Battery' -and $dischargeRate -and $dischargeRate -gt 0) {
+        return [pscustomobject]@{
+            rateMW = $dischargeRate
+            source = 'sample_discharge_rate'
+        }
+    }
+
+    $lowPowerRate = $null
+    $activeRate = $null
+    if ($Model -and $Model.lowPowerRate) {
+        $lowPowerRate = ConvertTo-NullableDouble $Model.lowPowerRate.rateMW
+    }
+    if ($Model -and $Model.activeRate) {
+        $activeRate = ConvertTo-NullableDouble $Model.activeRate.rateMW
+    }
+
+    $derivedMode = [string](Get-ObjectPropertyValue -InputObject $Sample -Name 'derivedMode')
+    $displayState = [string](Get-ObjectPropertyValue -InputObject $Sample -Name 'displayState')
+    if (($derivedMode -eq 'battery_low_power' -or $displayState -eq 'display_likely_off') -and $lowPowerRate) {
+        return [pscustomobject]@{
+            rateMW = $lowPowerRate
+            source = 'model_low_power_rate'
+        }
+    }
+
+    if ($activeRate) {
+        return [pscustomobject]@{
+            rateMW = $activeRate
+            source = 'model_active_rate'
+        }
+    }
+
+    return $null
+}
+
+function Get-BatteryHistorySummary {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SamplesPath,
+
+        $Model,
+
+        [Parameter(Mandatory)]
+        $Settings,
+
+        [int]$MaxGapMinutes = 5
+    )
+
+    $now = [DateTimeOffset]::Now
+    $samples = @()
+    if (Test-Path -LiteralPath $SamplesPath) {
+        $samples = @(Import-Csv -LiteralPath $SamplesPath | Sort-Object timestamp)
+    }
+
+    $all = New-HistoryBucket -Name 'all'
+    $today = New-HistoryBucket -Name 'today'
+    $last24h = New-HistoryBucket -Name 'last24h'
+    $last7d = New-HistoryBucket -Name 'last7d'
+    $tariffBreakdown = @{}
+
+    for ($i = 1; $i -lt $samples.Count; $i++) {
+        try {
+            $previous = $samples[$i - 1]
+            $current = $samples[$i]
+            $previousTime = ConvertTo-DateTimeOffsetValue -Value $previous.timestamp
+            $currentTime = ConvertTo-DateTimeOffsetValue -Value $current.timestamp
+            $durationMinutes = ($currentTime - $previousTime).TotalMinutes
+
+            if ($durationMinutes -le 0 -or $durationMinutes -gt $MaxGapMinutes) {
+                continue
+            }
+
+            $rate = Get-SampleEstimatedRateMW -Sample $previous -Model $Model
+            $estimatedKWh = $null
+            $estimatedCostEur = $null
+
+            if ($rate -and $rate.rateMW -gt 0) {
+                $tariffPeriod = Get-CurrentTariffPeriod -Settings $Settings -Timestamp $previousTime
+                $price = Get-TariffPrice -Settings $Settings -Period $tariffPeriod.period
+                $estimatedKWh = (([double]$rate.rateMW / 1000000.0) / [double]$Settings.adapterEfficiency) * ($durationMinutes / 60.0)
+                $estimatedCostEur = $estimatedKWh * [double]$price.priceWithVatEurPerKWh
+
+                $tariffKey = $tariffPeriod.period
+                if (-not $tariffBreakdown.ContainsKey($tariffKey)) {
+                    $tariffBreakdown[$tariffKey] = [pscustomobject]@{
+                        minutes          = 0.0
+                        estimatedKWh     = 0.0
+                        estimatedCostEur = 0.0
+                    }
+                }
+                $tariffBreakdown[$tariffKey].minutes = [math]::Round($tariffBreakdown[$tariffKey].minutes + $durationMinutes, 4)
+                $tariffBreakdown[$tariffKey].estimatedKWh = [math]::Round($tariffBreakdown[$tariffKey].estimatedKWh + $estimatedKWh, 8)
+                $tariffBreakdown[$tariffKey].estimatedCostEur = [math]::Round($tariffBreakdown[$tariffKey].estimatedCostEur + $estimatedCostEur, 8)
+            }
+
+            Add-HistorySegmentToBucket -Bucket $all -PreviousSample $previous -DurationMinutes $durationMinutes -EstimatedKWh $estimatedKWh -EstimatedCostEur $estimatedCostEur
+
+            if ($previousTime.LocalDateTime.Date -eq $now.LocalDateTime.Date) {
+                Add-HistorySegmentToBucket -Bucket $today -PreviousSample $previous -DurationMinutes $durationMinutes -EstimatedKWh $estimatedKWh -EstimatedCostEur $estimatedCostEur
+            }
+            if ($previousTime -ge $now.AddHours(-24)) {
+                Add-HistorySegmentToBucket -Bucket $last24h -PreviousSample $previous -DurationMinutes $durationMinutes -EstimatedKWh $estimatedKWh -EstimatedCostEur $estimatedCostEur
+            }
+            if ($previousTime -ge $now.AddDays(-7)) {
+                Add-HistorySegmentToBucket -Bucket $last7d -PreviousSample $previous -DurationMinutes $durationMinutes -EstimatedKWh $estimatedKWh -EstimatedCostEur $estimatedCostEur
+            }
+        }
+        catch {
+            continue
+        }
+    }
+
+    $firstSampleTime = $null
+    $lastSampleTime = $null
+    if ($samples.Count -gt 0) {
+        $firstSampleTime = (ConvertTo-DateTimeOffsetValue -Value $samples[0].timestamp).ToString('o')
+        $lastSampleTime = (ConvertTo-DateTimeOffsetValue -Value $samples[$samples.Count - 1].timestamp).ToString('o')
+    }
+
+    [pscustomobject]@{
+        generatedAt     = $now.ToString('o')
+        sampleCount     = $samples.Count
+        firstSampleTime = $firstSampleTime
+        lastSampleTime  = $lastSampleTime
+        maxGapMinutes   = $MaxGapMinutes
+        uptime          = Get-OsUptimeSummary
+        periods         = @(
+            Complete-HistoryBucket -Bucket $today
+            Complete-HistoryBucket -Bucket $last24h
+            Complete-HistoryBucket -Bucket $last7d
+            Complete-HistoryBucket -Bucket $all
+        )
+        tariffBreakdown = [pscustomobject]$tariffBreakdown
+        note            = 'Monitored time is inferred from telemetry samples. Long gaps are excluded.'
     }
 }
 
