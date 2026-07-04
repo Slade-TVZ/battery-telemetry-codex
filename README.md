@@ -10,6 +10,7 @@ Small Windows PowerShell project that records local battery telemetry and keeps 
 - `scripts\show-battery.ps1` prints only the short chat-friendly battery summary
 - `scripts\install-task.ps1` installs a Scheduled Task that runs the collector every minute and at logon
 - `scripts\start-low-power-learning-session.ps1` records an unplug-to-replug low-power learning session and rebuilds the model when AC returns
+- `data\settings.json` configures the electricity tariff, VAT, monthly hours, and Dell adapter efficiency used for cost estimates
 
 ## Typical usage
 
@@ -51,6 +52,18 @@ Then unplug the charger, close or turn off the screen, and plug the charger back
 - `data\current-status.json`: latest status snapshot and estimates
 - `data\install-state.json`: scheduled task install metadata
 - `data\sessions\low-power-*.json`: completed or failed low-power learning sessions
+
+## Electricity cost estimate
+
+The default cost model uses HEP Bijeli VT/NT household pricing, 13% VAT, and an 88% efficient older Dell adapter. Fixed monthly meter fees are excluded because they are paid regardless of the laptop.
+
+The brief status includes:
+
+- laptop-side watts from live battery discharge or learned history
+- wall-side watts after adapter loss
+- current VT/NT period
+- estimated monthly kWh and EUR for 24/7 operation in the detected mode
+- inferred display state when Windows exposes enough idle/display evidence
 
 ## Notes
 

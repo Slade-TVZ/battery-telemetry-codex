@@ -11,6 +11,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Get-ProjectRootFromScriptRoot -ScriptRoot $PSScriptRoot
 $paths = Get-ProjectPaths -ProjectRoot $projectRoot
 Ensure-Directory -Path $paths.DataDir
+$settings = Get-BatterySettings -SettingsPath $paths.SettingsPath
 
 $snapshot = Get-BatterySnapshot
 Save-BatterySample -Path $paths.SamplesPath -Snapshot $snapshot
@@ -21,7 +22,7 @@ if ($ForceModelRefresh -or (Test-ModelNeedsRefresh -ModelPath $paths.ModelPath))
 }
 
 $model = Read-JsonFile -Path $paths.ModelPath
-$status = Get-BatteryStatusPayload -Snapshot $snapshot -Model $model
+$status = Get-BatteryStatusPayload -Snapshot $snapshot -Model $model -Settings $settings
 Write-JsonFile -Path $paths.CurrentStatusPath -InputObject $status
 
 $status

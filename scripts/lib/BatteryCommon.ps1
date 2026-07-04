@@ -35,6 +35,7 @@ function Get-ProjectPaths {
         ModelPath         = Join-Path $dataDir 'model.json'
         CurrentStatusPath = Join-Path $dataDir 'current-status.json'
         InstallStatePath  = Join-Path $dataDir 'install-state.json'
+        SettingsPath      = Join-Path $dataDir 'settings.json'
     }
 }
 
@@ -96,6 +97,132 @@ function Read-JsonFile {
     }
 
     return $raw | ConvertFrom-Json
+}
+
+function Get-BatterySettings {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SettingsPath
+    )
+
+    $defaults = [pscustomobject]@{
+        tariffModel     = 'HEP_BIJELI_VT_NT'
+        adapterEfficiency = 0.88
+        vatRate         = 0.13
+        monthlyHours    = 730
+        oieEurPerKWh    = 0.013239
+        tariffs         = [pscustomobject]@{
+            HEP_BIJELI_VT_NT = [pscustomobject]@{
+                currency                 = 'EUR'
+                energyVTEurPerKWh        = 0.097189
+                energyNTEurPerKWh        = 0.047688
+                networkVTEurPerKWh       = 0.065702
+                networkNTEurPerKWh       = 0.028689
+                fixedMonthlyFeesExcluded = $true
+            }
+        }
+        seasonSchedules = [pscustomobject]@{
+            summer = [pscustomobject]@{ vtStartHour = 8; vtEndHour = 22 }
+            winter = [pscustomobject]@{ vtStartHour = 7; vtEndHour = 21 }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SettingsPath)) {
+        return $defaults
+    }
+
+    $settings = Read-JsonFile -Path $SettingsPath
+    if (-not $settings) {
+        return $defaults
+    }
+
+    return $settings
+}
+
+function Get-UserIdleSeconds {
+    try {
+        if (-not ('BatteryTelemetry.NativeMethods' -as [type])) {
+            Add-Type -TypeDefinition @'
+namespace BatteryTelemetry {
+    using System;
+    using System.Runtime.InteropServices;
+
+    public static class NativeMethods {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LASTINPUTINFO {
+            public uint cbSize;
+            public uint dwTime;
+        }
+
+        [DllImport("user32.dll")]
+        public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+        public static uint GetIdleMilliseconds() {
+            LASTINPUTINFO lii = new LASTINPUTINFO();
+            lii.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+            if (!GetLastInputInfo(ref lii)) {
+                return 0;
+            }
+            return ((uint)Environment.TickCount - lii.dwTime);
+        }
+    }
+}
+'@
+        }
+
+        return [math]::Round([BatteryTelemetry.NativeMethods]::GetIdleMilliseconds() / 1000.0, 1)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-DisplayStateEstimate {
+    param(
+        [Nullable[int]]$DisplayTimeoutSeconds
+    )
+
+    $idleSeconds = Get-UserIdleSeconds
+    $monitorAvailability = @(Get-SafeCimInstance -ClassName 'Win32_DesktopMonitor' |
+        Select-Object -ExpandProperty Availability -ErrorAction SilentlyContinue)
+    $evidence = New-Object System.Collections.Generic.List[string]
+    $state = 'display_state_unknown'
+    $confidence = 0.25
+
+    if ($null -ne $idleSeconds) {
+        $evidence.Add(('user_idle_seconds={0}' -f $idleSeconds))
+    }
+
+    if ($monitorAvailability.Count -gt 0) {
+        $evidence.Add(('monitor_availability={0}' -f (($monitorAvailability | ForEach-Object { [string]$_ }) -join ',')))
+    }
+
+    if ($DisplayTimeoutSeconds -and $DisplayTimeoutSeconds -gt 0) {
+        $evidence.Add(('display_timeout_seconds={0}' -f $DisplayTimeoutSeconds))
+        if ($null -ne $idleSeconds -and $idleSeconds -ge ($DisplayTimeoutSeconds + 30)) {
+            $state = 'display_likely_off'
+            $confidence = 0.75
+        }
+        elseif ($null -ne $idleSeconds -and $idleSeconds -lt $DisplayTimeoutSeconds) {
+            $state = 'display_likely_on'
+            $confidence = 0.65
+        }
+    }
+
+    if ($monitorAvailability | Where-Object { $_ -in @(7, 8, 13, 14) }) {
+        if ($state -eq 'display_state_unknown') {
+            $state = 'display_likely_off'
+            $confidence = 0.55
+        }
+        $evidence.Add('monitor_reports_low_power_or_off')
+    }
+
+    [pscustomobject]@{
+        state      = $state
+        confidence = $confidence
+        idleSeconds = $idleSeconds
+        evidence   = @($evidence)
+    }
 }
 
 function Get-SafeCimInstance {
@@ -297,6 +424,8 @@ function Get-BatterySnapshot {
     $dischargeRateMW = ConvertTo-NullableDouble $batteryStatus.DischargeRate
     $chargeRateMW = ConvertTo-NullableDouble $batteryStatus.ChargeRate
     $powerSource = if ($batteryStatus.PowerOnline) { 'AC' } else { 'Battery' }
+    $displayTimeoutSeconds = Get-DisplayTimeoutSeconds -PowerSource $(if ($powerSource -eq 'AC') { 'AC' } else { 'DC' })
+    $displayState = Get-DisplayStateEstimate -DisplayTimeoutSeconds $displayTimeoutSeconds
 
     $derivedMode = 'ac'
     if ($powerSource -eq 'Battery') {
@@ -322,7 +451,11 @@ function Get-BatterySnapshot {
         DischargeRateMW        = if ($dischargeRateMW -gt 0) { $dischargeRateMW } else { $null }
         DerivedMode            = $derivedMode
         PowerScheme            = Get-ActivePowerSchemeName
-        DisplayTimeoutSeconds  = Get-DisplayTimeoutSeconds -PowerSource $(if ($powerSource -eq 'AC') { 'AC' } else { 'DC' })
+        DisplayTimeoutSeconds  = $displayTimeoutSeconds
+        DisplayState           = $displayState.state
+        DisplayStateConfidence = $displayState.confidence
+        IdleSeconds            = $displayState.idleSeconds
+        DisplayEvidence        = $displayState.evidence
         CycleCount             = if ($cycleInfo) { ConvertTo-NullableDouble $cycleInfo.CycleCount } else { $null }
     }
 }
@@ -353,6 +486,9 @@ function Save-BatterySample {
         derivedMode           = $Snapshot.DerivedMode
         powerScheme           = $Snapshot.PowerScheme
         displayTimeoutSeconds = $Snapshot.DisplayTimeoutSeconds
+        displayState          = $Snapshot.DisplayState
+        displayStateConfidence = $Snapshot.DisplayStateConfidence
+        idleSeconds           = $Snapshot.IdleSeconds
         cycleCount            = $Snapshot.CycleCount
     }
 
@@ -699,12 +835,154 @@ function Get-ModelRuntimeMinutes {
     return [int][math]::Round(($RemainingCapacityMWh * 60.0) / $RateMW)
 }
 
+function Get-CurrentTariffPeriod {
+    param(
+        [Parameter(Mandatory)]
+        $Settings,
+
+        [DateTimeOffset]$Timestamp = [DateTimeOffset]::Now
+    )
+
+    $localDate = $Timestamp.LocalDateTime
+    $isSummer = [TimeZoneInfo]::Local.IsDaylightSavingTime($localDate)
+    $schedule = if ($isSummer) { $Settings.seasonSchedules.summer } else { $Settings.seasonSchedules.winter }
+    $hour = $localDate.Hour
+    $vtStart = [int]$schedule.vtStartHour
+    $vtEnd = [int]$schedule.vtEndHour
+    $period = if ($hour -ge $vtStart -and $hour -lt $vtEnd) { 'VT' } else { 'NT' }
+
+    [pscustomobject]@{
+        period      = $period
+        season      = if ($isSummer) { 'summer' } else { 'winter' }
+        vtStartHour = $vtStart
+        vtEndHour   = $vtEnd
+    }
+}
+
+function Get-TariffPrice {
+    param(
+        [Parameter(Mandatory)]
+        $Settings,
+
+        [Parameter(Mandatory)]
+        [string]$Period
+    )
+
+    $tariff = $Settings.tariffs.($Settings.tariffModel)
+    if (-not $tariff) {
+        throw ('Unknown tariff model: {0}' -f $Settings.tariffModel)
+    }
+
+    $energy = if ($Period -eq 'VT') { [double]$tariff.energyVTEurPerKWh } else { [double]$tariff.energyNTEurPerKWh }
+    $network = if ($Period -eq 'VT') { [double]$tariff.networkVTEurPerKWh } else { [double]$tariff.networkNTEurPerKWh }
+    $oie = [double]$Settings.oieEurPerKWh
+    $withoutVat = $energy + $network + $oie
+    $withVat = $withoutVat * (1.0 + [double]$Settings.vatRate)
+
+    [pscustomobject]@{
+        currency                 = $tariff.currency
+        energyEurPerKWh          = [math]::Round($energy, 6)
+        networkEurPerKWh         = [math]::Round($network, 6)
+        oieEurPerKWh             = [math]::Round($oie, 6)
+        priceWithoutVatEurPerKWh = [math]::Round($withoutVat, 6)
+        priceWithVatEurPerKWh    = [math]::Round($withVat, 6)
+        fixedMonthlyFeesExcluded = [bool]$tariff.fixedMonthlyFeesExcluded
+    }
+}
+
+function Get-EstimatedPowerCost {
+    param(
+        [Parameter(Mandatory)]
+        $Snapshot,
+
+        [Parameter(Mandatory)]
+        $Model,
+
+        [Parameter(Mandatory)]
+        $Settings,
+
+        [Nullable[double]]$ActiveRateMW,
+
+        [Nullable[double]]$LowPowerRateMW,
+
+        [string]$ActiveSource,
+
+        [string]$LowPowerSource
+    )
+
+    $dcPowerMW = $null
+    $powerSource = $null
+    $confidence = $null
+    $costMode = $Snapshot.DerivedMode
+
+    if ($Snapshot.PowerSource -eq 'Battery' -and $Snapshot.DischargeRateMW -and $Snapshot.DischargeRateMW -gt 0) {
+        $dcPowerMW = [double]$Snapshot.DischargeRateMW
+        $powerSource = if ($Snapshot.DerivedMode -eq 'battery_low_power') { 'live_low_power_rate' } else { 'live_discharge_rate' }
+        $confidence = if ($Snapshot.DerivedMode -eq 'battery_low_power') { 0.75 } else { 0.9 }
+    }
+    elseif ($Snapshot.DisplayState -eq 'display_likely_off' -and $LowPowerRateMW) {
+        $dcPowerMW = [double]$LowPowerRateMW
+        $powerSource = $LowPowerSource
+        $confidence = ConvertTo-NullableDouble $Model.lowPowerRate.confidence
+        $costMode = 'ac_estimated_low_power'
+    }
+    elseif ($ActiveRateMW) {
+        $dcPowerMW = [double]$ActiveRateMW
+        $powerSource = $ActiveSource
+        $confidence = ConvertTo-NullableDouble $Model.activeRate.confidence
+        $costMode = 'ac_estimated_active'
+    }
+    elseif ($LowPowerRateMW) {
+        $dcPowerMW = [double]$LowPowerRateMW
+        $powerSource = $LowPowerSource
+        $confidence = ConvertTo-NullableDouble $Model.lowPowerRate.confidence
+        $costMode = 'ac_estimated_low_power'
+    }
+
+    if ($null -eq $dcPowerMW) {
+        return $null
+    }
+
+    $adapterEfficiency = [double]$Settings.adapterEfficiency
+    if ($adapterEfficiency -le 0 -or $adapterEfficiency -gt 1) {
+        throw 'adapterEfficiency must be > 0 and <= 1.'
+    }
+
+    $tariffPeriod = Get-CurrentTariffPeriod -Settings $Settings
+    $price = Get-TariffPrice -Settings $Settings -Period $tariffPeriod.period
+    $dcPowerW = $dcPowerMW / 1000.0
+    $wallPowerW = $dcPowerW / $adapterEfficiency
+    $monthlyKWh = ($wallPowerW / 1000.0) * [double]$Settings.monthlyHours
+    $monthlyCost = $monthlyKWh * [double]$price.priceWithVatEurPerKWh
+
+    [pscustomobject]@{
+        mode                       = $costMode
+        dcPowerW                   = [math]::Round($dcPowerW, 2)
+        estimatedWallPowerW        = [math]::Round($wallPowerW, 2)
+        adapterEfficiency          = $adapterEfficiency
+        adapterLossPercent         = [math]::Round((1.0 - $adapterEfficiency) * 100.0, 1)
+        tariffModel                = $Settings.tariffModel
+        tariffNow                  = $tariffPeriod.period
+        tariffSeason               = $tariffPeriod.season
+        variablePriceEurPerKWh     = $price.priceWithVatEurPerKWh
+        variablePriceWithoutVatEurPerKWh = $price.priceWithoutVatEurPerKWh
+        monthlyHours               = [double]$Settings.monthlyHours
+        monthlyKWh                 = [math]::Round($monthlyKWh, 2)
+        monthlyCostEur             = [math]::Round($monthlyCost, 2)
+        fixedMonthlyFeesExcluded   = $price.fixedMonthlyFeesExcluded
+        costSource                 = $powerSource
+        confidence                 = $confidence
+    }
+}
+
 function Get-BatteryStatusPayload {
     param(
         [Parameter(Mandatory)]
         $Snapshot,
 
-        $Model
+        $Model,
+
+        $Settings
     )
 
     $activeRateMW = $null
@@ -739,6 +1017,10 @@ function Get-BatteryStatusPayload {
 
     $activeMinutes = Get-ModelRuntimeMinutes -RemainingCapacityMWh $Snapshot.RemainingCapacityMWh -RateMW $activeRateMW
     $lowPowerMinutes = Get-ModelRuntimeMinutes -RemainingCapacityMWh $Snapshot.RemainingCapacityMWh -RateMW $lowPowerRateMW
+    if (-not $Settings) {
+        $Settings = Get-BatterySettings -SettingsPath ''
+    }
+    $powerCost = Get-EstimatedPowerCost -Snapshot $Snapshot -Model $Model -Settings $Settings -ActiveRateMW $activeRateMW -LowPowerRateMW $lowPowerRateMW -ActiveSource $activeSource -LowPowerSource $lowPowerSource
 
     [pscustomobject]@{
         generatedAt               = [DateTimeOffset]::Now.ToString('o')
@@ -754,6 +1036,13 @@ function Get-BatteryStatusPayload {
         chargeRateMW              = $Snapshot.ChargeRateMW
         powerScheme               = $Snapshot.PowerScheme
         displayTimeoutSeconds     = $Snapshot.DisplayTimeoutSeconds
+        display                   = [pscustomobject]@{
+            state      = $Snapshot.DisplayState
+            confidence = $Snapshot.DisplayStateConfidence
+            idleSeconds = $Snapshot.IdleSeconds
+            evidence   = $Snapshot.DisplayEvidence
+        }
+        powerCost                 = $powerCost
         estimatedActiveMinutes    = $activeMinutes
         estimatedLowPowerMinutes  = $lowPowerMinutes
         activeEstimate            = [pscustomobject]@{
@@ -802,13 +1091,25 @@ function Get-BatteryChatSummary {
     $sourceLabel = if ($Status.powerSource -eq 'AC') { 'struja' } else { 'baterija' }
     $activeDuration = Format-MinutesAsDuration -Minutes $Status.estimatedActiveMinutes
     $lowPowerDuration = Format-MinutesAsDuration -Minutes $Status.estimatedLowPowerMinutes
+    $displayLabel = switch ($Status.display.state) {
+        'display_likely_off' { 'ekran vjerojatno ugasen' }
+        'display_likely_on' { 'ekran vjerojatno ukljucen' }
+        default { 'stanje ekrana nepoznato' }
+    }
 
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add(('Baterija: {0}%' -f ([math]::Round([double]$Status.chargePercent, 1))))
     $lines.Add(('Napajanje: {0}' -f $sourceLabel))
+    $lines.Add(('Mod: {0}, {1}' -f $Status.derivedMode, $displayLabel))
     $lines.Add(('Zadnje mjerenje: {0} ({1} min staro)' -f $sampleTime.ToString('yyyy-MM-dd HH:mm'), $sampleAgeMinutes))
     $lines.Add(('Ako iskljucis struju: oko {0}' -f $activeDuration))
     $lines.Add(('Zatvoren ekran / low-power: oko {0}' -f $lowPowerDuration))
+
+    if ($Status.powerCost) {
+        $lines.Add(('Trenutna procjena laptopa: {0} W' -f $Status.powerCost.dcPowerW))
+        $lines.Add(('Procjena iz zida s Dell adapterom {0:p0}: {1} W' -f [double]$Status.powerCost.adapterEfficiency, $Status.powerCost.estimatedWallPowerW))
+        $lines.Add(('Mjesecno 24/7 ovako: {0} kWh, oko {1} EUR ({2}, {3} EUR/kWh)' -f $Status.powerCost.monthlyKWh, $Status.powerCost.monthlyCostEur, $Status.powerCost.tariffNow, $Status.powerCost.variablePriceEurPerKWh))
+    }
 
     $activeConfidence = ConvertTo-NullableDouble $Status.activeEstimate.confidence
     if ($null -ne $activeConfidence -and $activeConfidence -lt 0.35) {

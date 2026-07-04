@@ -1,0 +1,27 @@
+{
+  "tariffModel": "HEP_BIJELI_VT_NT",
+  "adapterEfficiency": 0.88,
+  "vatRate": 0.13,
+  "monthlyHours": 730,
+  "oieEurPerKWh": 0.013239,
+  "tariffs": {
+    "HEP_BIJELI_VT_NT": {
+      "currency": "EUR",
+      "energyVTEurPerKWh": 0.097189,
+      "energyNTEurPerKWh": 0.047688,
+      "networkVTEurPerKWh": 0.065702,
+      "networkNTEurPerKWh": 0.028689,
+      "fixedMonthlyFeesExcluded": true
+    }
+  },
+  "seasonSchedules": {
+    "summer": {
+      "vtStartHour": 8,
+      "vtEndHour": 22
+    },
+    "winter": {
+      "vtStartHour": 7,
+      "vtEndHour": 21
+    }
+  }
+}
