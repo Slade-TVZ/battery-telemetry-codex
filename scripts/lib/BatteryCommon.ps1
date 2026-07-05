@@ -447,12 +447,27 @@ function ConvertTo-NullableDouble {
         return $null
     }
 
-    try {
-        return [double]$text
+    $styles = [System.Globalization.NumberStyles]::Float
+    $parsed = 0.0
+
+    if ([double]::TryParse($text, $styles, $script:InvariantCulture, [ref]$parsed)) {
+        return $parsed
     }
-    catch {
-        return $null
+
+    $normalized = $text.Trim()
+    if ($normalized.Contains(',') -and -not $normalized.Contains('.')) {
+        $normalized = $normalized.Replace(',', '.')
+        if ([double]::TryParse($normalized, $styles, $script:InvariantCulture, [ref]$parsed)) {
+            return $parsed
+        }
     }
+
+    $currentCulture = [System.Globalization.CultureInfo]::CurrentCulture
+    if ([double]::TryParse($text, $styles, $currentCulture, [ref]$parsed)) {
+        return $parsed
+    }
+
+    return $null
 }
 
 function Get-ObjectPropertyValue {
