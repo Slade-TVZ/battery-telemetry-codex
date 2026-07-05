@@ -108,6 +108,9 @@ function Get-BatterySettings {
     $defaults = [pscustomobject]@{
         tariffModel     = 'HEP_BIJELI_VT_NT'
         adapterEfficiency = 0.88
+        raplNonCpuOverheadW = 6
+        raplActiveThresholdW = 5
+        preferRaplForAcEstimate = $true
         vatRate         = 0.13
         monthlyHours    = 730
         oieEurPerKWh    = 0.013239
@@ -282,6 +285,156 @@ function Get-DisplayTimeoutSeconds {
     return $null
 }
 
+function Get-SettingDouble {
+    param(
+        $Settings,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [double]$Default
+    )
+
+    $value = Get-ObjectPropertyValue -InputObject $Settings -Name $Name
+    $converted = ConvertTo-NullableDouble $value
+    if ($null -eq $converted) {
+        return $Default
+    }
+
+    return $converted
+}
+
+function Get-SettingBool {
+    param(
+        $Settings,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [bool]$Default
+    )
+
+    $value = Get-ObjectPropertyValue -InputObject $Settings -Name $Name
+    if ($null -eq $value) {
+        return $Default
+    }
+
+    return [bool]$value
+}
+
+function Convert-MilliwattsToWatts {
+    param($Value)
+
+    $milliwatts = ConvertTo-NullableDouble $Value
+    if ($null -eq $milliwatts -or $milliwatts -le 0) {
+        return $null
+    }
+
+    return [math]::Round($milliwatts / 1000.0, 2)
+}
+
+function Get-PowerTelemetry {
+    param(
+        [Parameter(Mandatory)]
+        $BatteryStatus,
+
+        [Parameter(Mandatory)]
+        [string]$PowerSource,
+
+        $Settings
+    )
+
+    if (-not $Settings) {
+        $Settings = Get-BatterySettings -SettingsPath ''
+    }
+
+    $adapterEfficiency = Get-SettingDouble -Settings $Settings -Name 'adapterEfficiency' -Default 0.88
+    if ($adapterEfficiency -le 0 -or $adapterEfficiency -gt 1) {
+        $adapterEfficiency = 0.88
+    }
+
+    $overheadW = Get-SettingDouble -Settings $Settings -Name 'raplNonCpuOverheadW' -Default 6
+    $activeThresholdW = Get-SettingDouble -Settings $Settings -Name 'raplActiveThresholdW' -Default 5
+    $preferRapl = Get-SettingBool -Settings $Settings -Name 'preferRaplForAcEstimate' -Default $true
+    $chargeW = Convert-MilliwattsToWatts $BatteryStatus.ChargeRate
+    $dischargeW = Convert-MilliwattsToWatts $BatteryStatus.DischargeRate
+
+    $platformMeterW = $null
+    $platformMeter = Get-SafeCimInstance -ClassName 'Win32_PerfFormattedData_PowerMeterCounter_PowerMeter' |
+        Where-Object { $_.Name -eq '_Total' -or $_.Name -like 'Power Meter*' } |
+        Sort-Object @{ Expression = { if ($_.Name -eq '_Total') { 0 } else { 1 } } } |
+        Select-Object -First 1
+    if ($platformMeter) {
+        $platformMeterW = Convert-MilliwattsToWatts $platformMeter.Power
+    }
+
+    $raplRows = @(Get-SafeCimInstance -ClassName 'Win32_PerfFormattedData_PowerMeterCounter_EnergyMeter')
+    $raplPackageW = $null
+    $raplCoreW = $null
+    $raplDramW = $null
+
+    foreach ($row in $raplRows) {
+        $powerW = Convert-MilliwattsToWatts $row.Power
+        if ($null -eq $powerW) {
+            continue
+        }
+
+        switch -Wildcard ([string]$row.Name) {
+            '*_PKG' { $raplPackageW = $powerW }
+            '*_PP0' { $raplCoreW = $powerW }
+            '*_DRAM' { $raplDramW = $powerW }
+        }
+    }
+
+    $estimatedDcSystemW = $null
+    $estimatedWallW = $null
+    $source = 'not_available'
+    $confidence = 0.0
+    $note = 'No usable power telemetry source was available.'
+
+    if ($PowerSource -eq 'Battery' -and $dischargeW) {
+        $estimatedDcSystemW = $dischargeW
+        $estimatedWallW = [math]::Round($estimatedDcSystemW / $adapterEfficiency, 2)
+        $source = 'battery_discharge'
+        $confidence = 0.9
+        $note = 'Battery discharge is the best live whole-system estimate while unplugged.'
+    }
+    elseif ($platformMeterW) {
+        $estimatedWallW = $platformMeterW
+        $estimatedDcSystemW = [math]::Round($platformMeterW * $adapterEfficiency, 2)
+        $source = 'platform_power_meter'
+        $confidence = 0.95
+        $note = 'Windows platform power meter reported a non-zero total power value.'
+    }
+    elseif ($preferRapl -and $raplPackageW) {
+        $estimatedDcSystemW = [math]::Round($raplPackageW + $overheadW + $(if ($chargeW) { $chargeW } else { 0 }), 2)
+        $estimatedWallW = [math]::Round($estimatedDcSystemW / $adapterEfficiency, 2)
+        $source = 'rapl_plus_overhead'
+        $confidence = 0.55
+        $note = 'Estimated from RAPL CPU package power plus configured non-CPU overhead and battery charge power.'
+    }
+
+    [pscustomobject]@{
+        platformPowerMeterW = $platformMeterW
+        raplPackageW        = $raplPackageW
+        raplCoreW           = $raplCoreW
+        raplDramW           = $raplDramW
+        batteryChargeW      = $chargeW
+        batteryDischargeW   = $dischargeW
+        raplNonCpuOverheadW = $overheadW
+        raplActiveThresholdW = $activeThresholdW
+        estimatedDcSystemW  = $estimatedDcSystemW
+        estimatedWallW      = $estimatedWallW
+        adapterEfficiency   = $adapterEfficiency
+        source              = $source
+        confidence          = $confidence
+        isRaplActive        = [bool]($raplPackageW -and $raplPackageW -ge $activeThresholdW)
+        note                = $note
+    }
+}
+
 function ConvertTo-NullableDouble {
     param($Value)
 
@@ -415,6 +568,10 @@ function Format-MinutesAsDuration {
 }
 
 function Get-BatterySnapshot {
+    param(
+        $Settings
+    )
+
     $batteryStatus = Get-SafeCimInstance -Namespace 'root\wmi' -ClassName 'BatteryStatus' | Select-Object -First 1
     if (-not $batteryStatus) {
         throw 'No battery was detected through root\wmi\BatteryStatus.'
@@ -446,6 +603,7 @@ function Get-BatterySnapshot {
     $powerSource = if ($batteryStatus.PowerOnline) { 'AC' } else { 'Battery' }
     $displayTimeoutSeconds = Get-DisplayTimeoutSeconds -PowerSource $(if ($powerSource -eq 'AC') { 'AC' } else { 'DC' })
     $displayState = Get-DisplayStateEstimate -DisplayTimeoutSeconds $displayTimeoutSeconds
+    $powerTelemetry = Get-PowerTelemetry -BatteryStatus $batteryStatus -PowerSource $powerSource -Settings $Settings
 
     $derivedMode = 'ac'
     if ($powerSource -eq 'Battery') {
@@ -476,6 +634,7 @@ function Get-BatterySnapshot {
         DisplayStateConfidence = $displayState.confidence
         IdleSeconds            = $displayState.idleSeconds
         DisplayEvidence        = $displayState.evidence
+        PowerTelemetry         = $powerTelemetry
         CycleCount             = if ($cycleInfo) { ConvertTo-NullableDouble $cycleInfo.CycleCount } else { $null }
     }
 }
@@ -509,6 +668,16 @@ function Save-BatterySample {
         displayState          = $Snapshot.DisplayState
         displayStateConfidence = $Snapshot.DisplayStateConfidence
         idleSeconds           = $Snapshot.IdleSeconds
+        platformPowerMeterW   = $Snapshot.PowerTelemetry.platformPowerMeterW
+        raplPackageW          = $Snapshot.PowerTelemetry.raplPackageW
+        raplCoreW             = $Snapshot.PowerTelemetry.raplCoreW
+        raplDramW             = $Snapshot.PowerTelemetry.raplDramW
+        batteryChargeW        = $Snapshot.PowerTelemetry.batteryChargeW
+        batteryDischargeW     = $Snapshot.PowerTelemetry.batteryDischargeW
+        estimatedDcSystemW    = $Snapshot.PowerTelemetry.estimatedDcSystemW
+        estimatedWallW        = $Snapshot.PowerTelemetry.estimatedWallW
+        powerTelemetrySource  = $Snapshot.PowerTelemetry.source
+        powerTelemetryConfidence = $Snapshot.PowerTelemetry.confidence
         cycleCount            = $Snapshot.CycleCount
     }
 
@@ -526,13 +695,46 @@ function Save-BatterySample {
                 }
                 [pscustomobject]$normalized
             }
-            $normalizedRows | Export-Csv -LiteralPath $Path -NoTypeInformation
+            for ($attempt = 1; $attempt -le 5; $attempt++) {
+                try {
+                    $normalizedRows | Export-Csv -LiteralPath $Path -NoTypeInformation -ErrorAction Stop
+                    break
+                }
+                catch {
+                    if ($attempt -eq 5) {
+                        throw
+                    }
+                    Start-Sleep -Milliseconds (150 * $attempt)
+                }
+            }
         }
 
-        $sample | Export-Csv -LiteralPath $Path -Append -NoTypeInformation
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+                $sample | Export-Csv -LiteralPath $Path -Append -NoTypeInformation -ErrorAction Stop
+                break
+            }
+            catch {
+                if ($attempt -eq 5) {
+                    throw
+                }
+                Start-Sleep -Milliseconds (150 * $attempt)
+            }
+        }
     }
     else {
-        $sample | Export-Csv -LiteralPath $Path -NoTypeInformation
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+                $sample | Export-Csv -LiteralPath $Path -NoTypeInformation -ErrorAction Stop
+                break
+            }
+            catch {
+                if ($attempt -eq 5) {
+                    throw
+                }
+                Start-Sleep -Milliseconds (150 * $attempt)
+            }
+        }
     }
 }
 
@@ -884,10 +1086,18 @@ function Get-StatusModeLabel {
         default { 'stanje ekrana nepoznato' }
     }
 
+    $powerTelemetry = Get-ObjectPropertyValue -InputObject $Status -Name 'powerTelemetry'
+    $raplActive = [bool]($powerTelemetry -and $powerTelemetry.isRaplActive)
+
     switch ([string]$Status.derivedMode) {
         'battery_active' { return ('Aktivan rad, {0}' -f $displayText) }
         'battery_low_power' { return ('Low-power/standby, {0}' -f $displayText) }
-        'ac' { return ('Na struji, {0}' -f $displayText) }
+        'ac' {
+            if ($raplActive) {
+                return ('Na struji, aktivan rad, {0}' -f $displayText)
+            }
+            return ('Na struji, {0}' -f $displayText)
+        }
         default { return ('{0}, {1}' -f $Status.derivedMode, $displayText) }
     }
 }
@@ -968,14 +1178,24 @@ function Get-EstimatedPowerCost {
     )
 
     $dcPowerMW = $null
+    $dcPowerWOverride = $null
+    $wallPowerWOverride = $null
     $powerSource = $null
     $confidence = $null
     $costMode = $Snapshot.DerivedMode
+    $powerTelemetry = Get-ObjectPropertyValue -InputObject $Snapshot -Name 'PowerTelemetry'
 
     if ($Snapshot.PowerSource -eq 'Battery' -and $Snapshot.DischargeRateMW -and $Snapshot.DischargeRateMW -gt 0) {
         $dcPowerMW = [double]$Snapshot.DischargeRateMW
         $powerSource = if ($Snapshot.DerivedMode -eq 'battery_low_power') { 'live_low_power_rate' } else { 'live_discharge_rate' }
         $confidence = if ($Snapshot.DerivedMode -eq 'battery_low_power') { 0.75 } else { 0.9 }
+    }
+    elseif ($Snapshot.PowerSource -eq 'AC' -and $powerTelemetry -and $powerTelemetry.estimatedWallW) {
+        $dcPowerWOverride = ConvertTo-NullableDouble $powerTelemetry.estimatedDcSystemW
+        $wallPowerWOverride = ConvertTo-NullableDouble $powerTelemetry.estimatedWallW
+        $powerSource = [string]$powerTelemetry.source
+        $confidence = ConvertTo-NullableDouble $powerTelemetry.confidence
+        $costMode = if ($powerTelemetry.isRaplActive) { 'ac_estimated_active' } else { 'ac_estimated_low_power' }
     }
     elseif ($Snapshot.DisplayState -eq 'display_likely_off' -and $LowPowerRateMW) {
         $dcPowerMW = [double]$LowPowerRateMW
@@ -996,7 +1216,7 @@ function Get-EstimatedPowerCost {
         $costMode = 'ac_estimated_low_power'
     }
 
-    if ($null -eq $dcPowerMW) {
+    if ($null -eq $dcPowerMW -and $null -eq $wallPowerWOverride) {
         return $null
     }
 
@@ -1007,8 +1227,8 @@ function Get-EstimatedPowerCost {
 
     $tariffPeriod = Get-CurrentTariffPeriod -Settings $Settings
     $price = Get-TariffPrice -Settings $Settings -Period $tariffPeriod.period
-    $dcPowerW = $dcPowerMW / 1000.0
-    $wallPowerW = $dcPowerW / $adapterEfficiency
+    $dcPowerW = if ($null -ne $dcPowerWOverride) { $dcPowerWOverride } else { $dcPowerMW / 1000.0 }
+    $wallPowerW = if ($null -ne $wallPowerWOverride) { $wallPowerWOverride } else { $dcPowerW / $adapterEfficiency }
     $monthlyKWh = ($wallPowerW / 1000.0) * [double]$Settings.monthlyHours
     $monthlyCost = $monthlyKWh * [double]$price.priceWithVatEurPerKWh
 
@@ -1132,10 +1352,20 @@ function Get-SampleEstimatedRateMW {
         $Model
     )
 
+    $estimatedWallW = ConvertTo-NullableDouble (Get-ObjectPropertyValue -InputObject $Sample -Name 'estimatedWallW')
+    if ($estimatedWallW -and $estimatedWallW -gt 0) {
+        return [pscustomobject]@{
+            rateMW = $null
+            wallW  = $estimatedWallW
+            source = 'sample_estimated_wall_power'
+        }
+    }
+
     $dischargeRate = ConvertTo-NullableDouble (Get-ObjectPropertyValue -InputObject $Sample -Name 'dischargeRateMW')
     if ([string](Get-ObjectPropertyValue -InputObject $Sample -Name 'powerSource') -eq 'Battery' -and $dischargeRate -and $dischargeRate -gt 0) {
         return [pscustomobject]@{
             rateMW = $dischargeRate
+            wallW  = $null
             source = 'sample_discharge_rate'
         }
     }
@@ -1154,6 +1384,7 @@ function Get-SampleEstimatedRateMW {
     if (($derivedMode -eq 'battery_low_power' -or $displayState -eq 'display_likely_off') -and $lowPowerRate) {
         return [pscustomobject]@{
             rateMW = $lowPowerRate
+            wallW  = $null
             source = 'model_low_power_rate'
         }
     }
@@ -1161,6 +1392,7 @@ function Get-SampleEstimatedRateMW {
     if ($activeRate) {
         return [pscustomobject]@{
             rateMW = $activeRate
+            wallW  = $null
             source = 'model_active_rate'
         }
     }
@@ -1209,10 +1441,15 @@ function Get-BatteryHistorySummary {
             $estimatedKWh = $null
             $estimatedCostEur = $null
 
-            if ($rate -and $rate.rateMW -gt 0) {
+            if ($rate -and (($rate.rateMW -and $rate.rateMW -gt 0) -or ($rate.wallW -and $rate.wallW -gt 0))) {
                 $tariffPeriod = Get-CurrentTariffPeriod -Settings $Settings -Timestamp $previousTime
                 $price = Get-TariffPrice -Settings $Settings -Period $tariffPeriod.period
-                $estimatedKWh = (([double]$rate.rateMW / 1000000.0) / [double]$Settings.adapterEfficiency) * ($durationMinutes / 60.0)
+                if ($rate.wallW -and $rate.wallW -gt 0) {
+                    $estimatedKWh = ([double]$rate.wallW / 1000.0) * ($durationMinutes / 60.0)
+                }
+                else {
+                    $estimatedKWh = (([double]$rate.rateMW / 1000000.0) / [double]$Settings.adapterEfficiency) * ($durationMinutes / 60.0)
+                }
                 $estimatedCostEur = $estimatedKWh * [double]$price.priceWithVatEurPerKWh
 
                 $tariffKey = $tariffPeriod.period
@@ -1342,6 +1579,7 @@ function Get-BatteryStatusPayload {
             idleSeconds = $Snapshot.IdleSeconds
             evidence   = $Snapshot.DisplayEvidence
         }
+        powerTelemetry            = $Snapshot.PowerTelemetry
         powerCost                 = $powerCost
         runtimeScenarios          = [pscustomobject]@{
             currentMeasured    = [pscustomobject]@{
@@ -1449,8 +1687,20 @@ function Get-BatteryChatSummary {
     }
 
     if ($Status.powerCost) {
-        $lines.Add(('Trenutna procjena laptopa: {0} W' -f $Status.powerCost.dcPowerW))
-        $lines.Add(('Procjena iz zida s Dell adapterom {0:p0}: {1} W' -f [double]$Status.powerCost.adapterEfficiency, $Status.powerCost.estimatedWallPowerW))
+        $powerTelemetry = Get-ObjectPropertyValue -InputObject $Status -Name 'powerTelemetry'
+        $lines.Add(('Procjena ukupno iz zida: {0} W' -f $Status.powerCost.estimatedWallPowerW))
+        $lines.Add(('Procjena laptopa prije adaptera: {0} W' -f $Status.powerCost.dcPowerW))
+        if ($powerTelemetry) {
+            if ($powerTelemetry.raplPackageW) {
+                $lines.Add(('CPU/RAPL izmjereno: {0} W' -f $powerTelemetry.raplPackageW))
+            }
+            if ($powerTelemetry.batteryChargeW) {
+                $lines.Add(('Punjenje baterije: {0} W' -f $powerTelemetry.batteryChargeW))
+            }
+            if ($powerTelemetry.source -eq 'rapl_plus_overhead') {
+                $lines.Add('Napomena: ukupno iz zida je procjena jer Dell/Windows ne daje direktan adapter power meter.')
+            }
+        }
         $lines.Add(('Mjesecno 24/7 ovako: {0} kWh, oko {1} EUR ({2}, {3} EUR/kWh)' -f $Status.powerCost.monthlyKWh, $Status.powerCost.monthlyCostEur, $Status.powerCost.tariffNow, $Status.powerCost.variablePriceEurPerKWh))
     }
 

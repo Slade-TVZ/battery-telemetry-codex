@@ -1,6 +1,9 @@
 {
   "tariffModel": "HEP_BIJELI_VT_NT",
   "adapterEfficiency": 0.88,
+  "raplNonCpuOverheadW": 6,
+  "raplActiveThresholdW": 5,
+  "preferRaplForAcEstimate": true,
   "vatRate": 0.13,
   "monthlyHours": 730,
   "oieEurPerKWh": 0.013239,

@@ -13,7 +13,7 @@ $paths = Get-ProjectPaths -ProjectRoot $projectRoot
 Ensure-Directory -Path $paths.DataDir
 $settings = Get-BatterySettings -SettingsPath $paths.SettingsPath
 
-$snapshot = Get-BatterySnapshot
+$snapshot = Get-BatterySnapshot -Settings $settings
 Save-BatterySample -Path $paths.SamplesPath -Snapshot $snapshot
 
 if ($ForceModelRefresh -or (Test-ModelNeedsRefresh -ModelPath $paths.ModelPath)) {

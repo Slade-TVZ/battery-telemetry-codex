@@ -81,9 +81,12 @@ The brief status includes:
 
 - laptop-side watts from live battery discharge or learned history
 - wall-side watts after adapter loss
+- AC power telemetry from Windows PowerMeter when available, or from RAPL CPU package power plus configured overhead
 - current VT/NT period
 - estimated monthly kWh and EUR for 24/7 operation in the detected mode
 - inferred display state when Windows exposes enough idle/display evidence
+
+On this Dell, Windows exposes RAPL CPU package power but the total platform `PowerMeter` currently returns `0`. Therefore AC wall power is estimated as `RAPL package W + configured non-CPU overhead + battery charge W`, adjusted for adapter efficiency. A physical wattmeter is still required for calibrated wall power.
 
 ## Runtime interpretation
 

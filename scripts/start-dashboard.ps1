@@ -335,8 +335,16 @@ $html = @'
       document.getElementById('mode').textContent = modeLabel(status);
       document.getElementById('lastSample').textContent = `Zadnje mjerenje: ${new Date(status.lastSampleTime).toLocaleString()}`;
       if (status.powerCost) {
+        const telemetry = status.powerTelemetry || {};
         document.getElementById('cost').textContent = `${fmt.format(status.powerCost.monthlyCostEur)} EUR`;
-        document.getElementById('watts').textContent = `${fmt.format(status.powerCost.estimatedWallPowerW)} W iz zida, ${fmt.format(status.powerCost.monthlyKWh)} kWh/mj`;
+        const parts = [
+          `${fmt.format(status.powerCost.estimatedWallPowerW)} W iz zida`,
+          `${fmt.format(status.powerCost.monthlyKWh)} kWh/mj`
+        ];
+        if (telemetry.raplPackageW) parts.push(`CPU/RAPL ${fmt.format(telemetry.raplPackageW)} W`);
+        if (telemetry.batteryChargeW) parts.push(`punjenje ${fmt.format(telemetry.batteryChargeW)} W`);
+        if (telemetry.source) parts.push(`izvor ${telemetry.source}`);
+        document.getElementById('watts').textContent = parts.join(', ');
       }
       setStatus('Status osvjezen.');
     }
